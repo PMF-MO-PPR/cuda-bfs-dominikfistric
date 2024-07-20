@@ -7,9 +7,6 @@ set (CMAKE_CUDA_STANDARD 17)
 
 find_package(CUDAToolkit REQUIRED)
 
-
-set(CMAKE_CUDA_ARCHITECTURES native)
-
-add_executable("main" main.cu labirint_io.cpp bfs.cpp sparse.cpp 
+add_executable("main" main.cu labirint_io.cpp bfs.cpp sparse.cpp
                       aux.cpp sparse.h bfs.h labirint_io.h)
 
