@@ -9,8 +9,21 @@ void check_input(LabIOMatrix const & mat, int start_row, int start_col,
 
 ///////// Vaša CUDA jezgra dolazi ovdje ////////////////////
 
-// VAŠ KOD
-
+__global__
+void bfs_kernel(CSRMat *incidence, int *level, int *newVertVisited, int currentLevel) {
+    int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex < incidence->nrows) {
+        if (level[vertex] == currentLevel - 1) {
+            for (int edge = incidence->rowPtrs[vertex]; edge < incidence->rowPtrs[vertex + 1]; ++edge) {
+                int neighbor = incidence->colIdx[edge];
+                if (level[neighbor] == -1) {
+                    level[neighbor] = currentLevel;
+                    *newVertVisited = 1;
+                }
+            }
+        }
+    }
+}
 ////////////////////////////////////////////////////////////
 
 int main(int argc, char * argv[])
@@ -45,8 +58,8 @@ int main(int argc, char * argv[])
     CSRMat csr_incidence(incidence);
     CSCMat csc_incidence(incidence);
 
-    csr_incidence.print();
-    csc_incidence.print();
+    // csr_incidence.print();
+    // csc_incidence.print();
 
     int start_idx = mat(start_row, start_col);
     int stop_idx  = mat(stop_row,stop_col);
@@ -55,17 +68,63 @@ int main(int argc, char * argv[])
     /// VAŠ CUDA kod  DOLAZI OVDJE /////////////////////////////////////////
     // ALOCIRAJ MEMORIJU NA GPU, KOPIRAJ PODATKE S CPU NA GPU,
     // POZOVI JEZGRU, KOPIRAJ LEVEL POLJE S GPU NA CPU.
-    // VAŠ KOD
+
+    CSRMat *d_csr_incidence;
+    cudaMalloc((void**) (&d_csr_incidence), sizeof(CSRMat));
+    cudaMemcpy(d_csr_incidence, &csr_incidence, sizeof(CSRMat), cudaMemcpyHostToDevice);
+
+    int *d_rowPtrs, *d_colIdx;
+    cudaMalloc(&d_rowPtrs, (csr_incidence.nrows + 1) * sizeof(int));
+    cudaMalloc(&d_colIdx, csr_incidence.nelem * sizeof(int));
+
+    cudaMemcpy(d_rowPtrs, csr_incidence.rowPtrs, (csr_incidence.nrows + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_colIdx, csr_incidence.colIdx, (csr_incidence.nelem) * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaMemcpy(&(d_csr_incidence->rowPtrs), &d_rowPtrs, sizeof(int*), cudaMemcpyHostToDevice);
+    cudaMemcpy(&(d_csr_incidence->colIdx), &d_colIdx, sizeof(int*), cudaMemcpyHostToDevice);
+
+    std::vector<int> level(csr_incidence.nrows, -1);
+    level[start_idx] = 0;
+
+    int *d_level;
+    cudaMalloc(&d_level, level.size() * sizeof(int));
+    cudaMemcpy(d_level, level.data(), level.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    int found_new = 0;
+    int *d_found_new;
+    cudaMalloc(&d_found_new, sizeof(int));
+
+    int current_level = 1;
+
+    const int BLOCK = 128;
+    const int GRID = (mat.no_blocks() + BLOCK - 1) / BLOCK;
+    do {
+        found_new = 0;
+        cudaMemcpy(d_found_new, &found_new, sizeof(int), cudaMemcpyHostToDevice);
+        bfs_kernel<<<BLOCK, GRID>>>(d_csr_incidence, d_level, d_found_new, current_level++);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&found_new, d_found_new, sizeof(int), cudaMemcpyDeviceToHost);
+    } while (found_new);
+
+
+    cudaMemcpy(level.data(), d_level, level.size() * sizeof(int), cudaMemcpyDeviceToHost);
+
     ///////////////////////////////////////////////////////////////////////
+
 
     std::vector<int>  path;  // STAZA
     // IZRAČUNAJ STAZU
-    // find_path(csc_incidence, stop_idx, level, path);
+    find_path(csc_incidence, stop_idx, level, path);
     // PRINTAJ STAZU U DATOTEKU
     mat.print_ascii("out_"+base_name(file_name), path);
 
     // POČISTITE MEMORIJU ////////////////////
-    //VAŠ KOD
+    cudaFree(d_found_new);
+    cudaFree(d_level);
+    cudaFree(d_rowPtrs);
+    cudaFree(d_colIdx);
+    cudaFree(d_csr_incidence);
     ///////////////////////////////////////////
+
     return 0;
 }
