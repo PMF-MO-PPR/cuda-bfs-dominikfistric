@@ -10,15 +10,17 @@ void check_input(LabIOMatrix const & mat, int start_row, int start_col,
 ///////// Vaša CUDA jezgra dolazi ovdje ////////////////////
 
 __global__
-void bfs_kernel(CSRMat *incidence, int *level, int *newVertVisited, int currentLevel) {
-    int vertex = blockIdx.x * blockDim.x + threadIdx.x;
-    if (vertex < incidence->nrows) {
+void bfs_kernel(CSRMat *incidence, int *level, int *prev_front, int *curr_front,
+                const int *prev_front_size, int *curr_front_size, int currentLevel) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < *prev_front_size) {
+        int vertex = prev_front[i];
         if (level[vertex] == currentLevel - 1) {
             for (int edge = incidence->rowPtrs[vertex]; edge < incidence->rowPtrs[vertex + 1]; ++edge) {
                 int neighbor = incidence->colIdx[edge];
-                if (level[neighbor] == -1) {
-                    level[neighbor] = currentLevel;
-                    *newVertVisited = 1;
+                if (atomicCAS(&level[neighbor], -1, currentLevel) == -1) {
+                    int idx = atomicAdd(curr_front_size, 1);
+                    curr_front[idx] = neighbor;
                 }
             }
         }
@@ -69,6 +71,8 @@ int main(int argc, char * argv[])
     // ALOCIRAJ MEMORIJU NA GPU, KOPIRAJ PODATKE S CPU NA GPU,
     // POZOVI JEZGRU, KOPIRAJ LEVEL POLJE S GPU NA CPU.
 
+    const int NODE_COUNT = mat.no_blocks();
+
     CSRMat *d_csr_incidence;
     cudaMalloc((void**) (&d_csr_incidence), sizeof(CSRMat));
     cudaMemcpy(d_csr_incidence, &csr_incidence, sizeof(CSRMat), cudaMemcpyHostToDevice);
@@ -90,22 +94,33 @@ int main(int argc, char * argv[])
     cudaMalloc(&d_level, level.size() * sizeof(int));
     cudaMemcpy(d_level, level.data(), level.size() * sizeof(int), cudaMemcpyHostToDevice);
 
-    int found_new = 0;
-    int *d_found_new;
-    cudaMalloc(&d_found_new, sizeof(int));
+    int *d_prev_visited;
+    cudaMalloc(&d_prev_visited, sizeof(int) * NODE_COUNT);
+    cudaMemcpy(d_prev_visited, &start_idx, sizeof(int), cudaMemcpyHostToDevice);
+    int *d_prev_visited_count;
+    cudaMalloc(&d_prev_visited_count, sizeof(int));
+    int prev_visited_count = 1;
+    cudaMemcpy(d_prev_visited_count, &prev_visited_count, sizeof(int), cudaMemcpyHostToDevice);
+
+    int *d_curr_visited;
+    cudaMalloc(&d_curr_visited, sizeof(int) * NODE_COUNT);
+    int *d_curr_visited_count;
+    cudaMalloc(&d_curr_visited_count, sizeof(int));
 
     int current_level = 1;
 
-    const int BLOCK = 128;
-    const int GRID = (mat.no_blocks() + BLOCK - 1) / BLOCK;
-    do {
-        found_new = 0;
-        cudaMemcpy(d_found_new, &found_new, sizeof(int), cudaMemcpyHostToDevice);
-        bfs_kernel<<<BLOCK, GRID>>>(d_csr_incidence, d_level, d_found_new, current_level++);
+    while (prev_visited_count > 0) {
+        const int BLOCK = 128;
+        const int GRID = (prev_visited_count + BLOCK - 1) / BLOCK;
+        bfs_kernel<<<BLOCK, GRID>>>(d_csr_incidence, d_level, d_prev_visited,
+                                    d_curr_visited, d_prev_visited_count,
+                                    d_curr_visited_count, current_level++);
         cudaDeviceSynchronize();
-        cudaMemcpy(&found_new, d_found_new, sizeof(int), cudaMemcpyDeviceToHost);
-    } while (found_new);
-
+        std::swap(d_prev_visited, d_curr_visited);
+        std::swap(d_prev_visited_count, d_curr_visited_count);
+        cudaMemcpy(&prev_visited_count, d_prev_visited_count, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemset(d_curr_visited_count, 0, sizeof(int));
+    }
 
     cudaMemcpy(level.data(), d_level, level.size() * sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -119,7 +134,10 @@ int main(int argc, char * argv[])
     mat.print_ascii("out_"+base_name(file_name), path);
 
     // POČISTITE MEMORIJU ////////////////////
-    cudaFree(d_found_new);
+    cudaFree(d_prev_visited);
+    cudaFree(d_prev_visited_count);
+    cudaFree(d_curr_visited);
+    cudaFree(d_curr_visited_count);
     cudaFree(d_level);
     cudaFree(d_rowPtrs);
     cudaFree(d_colIdx);
